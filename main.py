@@ -50,7 +50,7 @@ def init_db():
 init_db()
 
 # 3. Modelo YOLO e Controle de Estado
-model = YOLO('yolov8m.pt')
+model = YOLO('yolov8n.pt')
 history_classes = defaultdict(list)
 ultima_refeicao_dt = datetime.datetime.now()
 primeira_refeicao_registrada = False
