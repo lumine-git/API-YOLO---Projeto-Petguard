@@ -81,6 +81,12 @@ async def analisar_frame(file: UploadFile = File(...)):
     if frame is None:
         return {"erro": "Imagem inválida."}
 
+    # REDUZ O TAMANHO DA IMAGEM PARA NÃO ESTOURAR A RAM DO RENDER
+    frame = cv2.resize(frame, (640, 640))
+
+    if frame is None:
+        return {"erro": "Imagem inválida."}
+
     results = model.track(frame, persist=True, classes=[15, 16, 45], conf=0.30, verbose=False)
 
     status_atual = "Fora da zona de alimentação"
