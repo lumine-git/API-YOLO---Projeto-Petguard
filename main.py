@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -8,13 +9,20 @@ import datetime
 import sqlite3
 from collections import defaultdict, Counter
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    global model
+    model = YOLO('yolov8n.pt')
+    yield
+
 app = FastAPI(
     title="PetGuard AI Backend",
-    description="API de Inteligência Computacional para Monitoramento Pet com YOLOv8",
-    version="2.0.0"
+    description="API Completa com ROI, Controle de Sessão de Alimentação e Métricas de Atividade Física",
+    version="4.0.0",
+    lifespan=lifespan
 )
 
-# 1. Configuração de CORS (Liberado para conexão com app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,77 +31,113 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Inicialização do Banco de Dados SQLite Local
-def init_db():
-    conn = sqlite3.connect("petguard_local.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS refeicoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            especie TEXT,
-            duracao_segundos INTEGER
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS alertas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            tipo_alerta TEXT,
-            mensagem TEXT,
-            lido INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# 3. Modelo YOLO e Controle de Estado
-model = YOLO('yolov8n.pt')
+DB_PATH = "petguard_local.db"
 history_classes = defaultdict(list)
-ultima_refeicao_dt = datetime.datetime.now()
-primeira_refeicao_registrada = False
-LIMITE_JEJUM_HORAS = 6.0
+
+# Armazenamento de posições anteriores e sessões na memória do processo
+posicoes_anteriores = {}  # {track_id: (x, y)}
+sessoes_interacao = {}   # {track_id: {"tipo": "ALIMENTACAO", "inicio": dt, "ultima_vista": dt}}
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Zonas de Interesse (ROI) configuradas no App pelo usuário
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS zonas_roi (
+                tipo TEXT PRIMARY KEY, -- 'comida' ou 'agua'
+                x1 REAL, y1 REAL, x2 REAL, y2 REAL
+            )
+        """)
+        # Configuração legada de cores
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS configuracao_potes (
+                tipo_pote TEXT PRIMARY KEY,
+                cor_predominante TEXT
+            )
+        """)
+        # Registro de Eventos (Alimentação, Hidratação, Atividade)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS registro_eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                pet_id INTEGER,
+                especie TEXT,
+                tipo_evento TEXT,
+                duracao_segundos INTEGER,
+                deslocamento_pixels REAL
+            )
+        """)
+        # Alertas prioritários
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS alertas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                categoria TEXT,
+                nivel_prioridade TEXT,
+                mensagem TEXT,
+                lido INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
 
 def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
-# --- ROTAS DA API ---
+def ponto_dentro_da_roi(ponto, roi):
+    """Verifica se o centro do pet está dentro da caixa delimitadora da ROI [x1, y1, x2, y2]."""
+    px, py = ponto
+    return roi["x1"] <= px <= roi["x2"] and roi["y1"] <= py <= roi["y2"]
 
-@app.get("/")
-def home():
-    return {
-        "status": "Online",
-        "sistema": "PetGuard AI Core",
-        "versao": "2.0.0",
-        "docs": "/docs"
+@app.post("/configurar-rois")
+def configurar_rois(payload: dict = Body(...)):
+    """
+    Recebe as coordenadas normalizadas ou em pixels das zonas de comida e água.
+    Exemplo payload:
+    {
+        "comida": {"x1": 100, "y1": 100, "x2": 250, "y2": 250},
+        "agua": {"x1": 300, "y1": 100, "x2": 450, "y2": 250}
     }
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for tipo, coords in payload.items():
+            if tipo in ["comida", "agua"]:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO zonas_roi (tipo, x1, y1, x2, y2) VALUES (?, ?, ?, ?, ?)",
+                    (tipo, coords["x1"], coords["y1"], coords["x2"], coords["y2"])
+                )
+        conn.commit()
+    return {"status": "Zonas de interesse (ROIs) configuradas com sucesso!"}
 
 @app.post("/analisar-frame")
 async def analisar_frame(file: UploadFile = File(...)):
-    global ultima_refeicao_dt, primeira_refeicao_registrada
+    global posicoes_anteriores, sessoes_interacao
 
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if frame is None:
-        return {"erro": "Imagem inválida."}
+        raise HTTPException(status_code=400, detail="Imagem inválida.")
 
-    # REDUZ O TAMANHO DA IMAGEM PARA NÃO ESTOURAR A RAM DO RENDER
     frame = cv2.resize(frame, (640, 640))
-
-    if frame is None:
-        return {"erro": "Imagem inválida."}
-
     results = model.track(frame, persist=True, classes=[15, 16, 45], conf=0.30, verbose=False)
 
-    status_atual = "Fora da zona de alimentação"
-    esta_comendo = False
-    bowls_centers = []
+    agora = datetime.datetime.now()
     pets = []
-    bounding_boxes_detectadas = []
+    
+    # Busca ROIs salvas no banco
+    rois = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT tipo, x1, y1, x2, y2 FROM zonas_roi")
+        for row in cursor.fetchall():
+            rois[row["tipo"]] = {"x1": row["x1"], "y1": row["y1"], "x2": row["x2"], "y2": row["y2"]}
 
     if results[0].boxes is not None and results[0].boxes.id is not None:
         boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -103,143 +147,74 @@ async def analisar_frame(file: UploadFile = File(...)):
 
         for box, cls_id, conf, track_id in zip(boxes, clss, confs, track_ids):
             class_name = model.names[int(cls_id)]
-            
-            bounding_boxes_detectadas.append({
-                "id": int(track_id),
-                "classe": class_name,
-                "confianca": round(float(conf), 2),
-                "box": [round(float(b), 1) for b in box]
-            })
 
             if class_name in ['dog', 'cat']:
                 history_classes[track_id].append(class_name)
+                if len(history_classes[track_id]) > 30:
+                    history_classes[track_id] = history_classes[track_id][-30:]
                 especie = Counter(history_classes[track_id]).most_common(1)[0][0]
+
+                centro_atual = get_center(box)
+                
+                # 1. CÁLCULO DE MOBILIDADE E ATIVIDADE FÍSICA
+                deslocamento = 0.0
+                if track_id in posicoes_anteriores:
+                    prev_x, prev_y = posicoes_anteriores[track_id]
+                    deslocamento = math.hypot(centro_atual[0] - prev_x, centro_atual[1] - prev_y)
+                posicoes_anteriores[track_id] = centro_atual
+
+                # Classifica o estado de atividade pontual
+                if deslocamento < 2.0:
+                    nivel_atividade = "Repouso / Inativo"
+                elif deslocamento < 15.0:
+                    nivel_atividade = "Atividade Moderada"
+                else:
+                    nivel_atividade = "Movimentação Intensa"
+
+                # 2. DETECÇÃO DE INTERAÇÃO COM ZONAS DE ALIMENTAÇÃO (ROI)
+                interagindo_tipo = None
+                for tipo_zona, coords_roi in rois.items():
+                    if ponto_dentro_da_roi(centro_atual, coords_roi):
+                        interagindo_tipo = "ALIMENTACAO" if tipo_zona == "comida" else "HIDRATACAO"
+                        break
+
+                # 3. GERENCIAMENTO DE SESSÃO COM DEBOUNCE (Evita falsos registros picados)
+                if interagindo_tipo:
+                    if track_id not in sessoes_interacao:
+                        sessoes_interacao[track_id] = {
+                            "tipo": interagindo_tipo,
+                            "inicio": agora,
+                            "ultima_vista": agora
+                        }
+                    else:
+                        sessoes_interacao[track_id]["ultima_vista"] = agora
+                else:
+                    # Se saiu da zona, verifica se a sessão expirou (mais de 60s longe)
+                    if track_id in sessoes_interacao:
+                        sessao = sessoes_interacao[track_id]
+                        tempo_ausente = (agora - sessao["ultima_vista"]).total_seconds()
+                        if tempo_ausente > 60:
+                            duracao_total = int((sessao["ultima_vista"] - sessao["inicio"]).total_seconds())
+                            if duracao_total >= 5:  # Considera evento válido apenas se durar mais de 5s
+                                with get_db() as conn:
+                                    cursor = conn.cursor()
+                                    cursor.execute(
+                                        "INSERT INTO registro_eventos (timestamp, pet_id, especie, tipo_evento, duracao_segundos, deslocamento_pixels) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (sessao["inicio"].strftime("%Y-%m-%d %H:%M:%S"), int(track_id), especie, sessao["tipo"], duracao_total, 0.0)
+                                    )
+                                    conn.commit()
+                            del sessoes_interacao[track_id]
+
                 pets.append({
                     "id": int(track_id),
                     "especie": especie,
-                    "center": get_center(box),
-                    "confianca": round(float(conf), 2)
+                    "nivel_atividade": nivel_atividade,
+                    "deslocamento_pixels": round(deslocamento, 2),
+                    "interagindo": interagindo_tipo if interagindo_tipo else "Nenhum"
                 })
-            elif class_name == 'bowl':
-                bowls_centers.append(get_center(box))
-
-        # Checa proximidade com o pote
-        for pet in pets:
-            for b_center in bowls_centers:
-                dist = math.hypot(pet['center'][0] - b_center[0], pet['center'][1] - b_center[1])
-                if dist < 180:
-                    esta_comendo = True
-                    status_atual = "Alimentando-se"
-                    agora = datetime.datetime.now()
-                    
-                    # Registra a refeição no SQLite se for um novo evento
-                    if not primeira_refeicao_registrada or (agora - ultima_refeicao_dt).total_seconds() > 300:
-                        conn = sqlite3.connect("petguard_local.db")
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "INSERT INTO refeicoes (timestamp, especie, duracao_segundos) VALUES (?, ?, ?)",
-                            (agora.strftime("%Y-%m-%d %H:%M:%S"), pet["especie"], 60)
-                        )
-                        conn.commit()
-                        conn.close()
-
-                    ultima_refeicao_dt = agora
-                    primeira_refeicao_registrada = True
-                    break
-
-    agora = datetime.datetime.now()
-    tempo_sem_comer_horas = (agora - ultima_refeicao_dt).total_seconds() / 3600.0 if primeira_refeicao_registrada else 0.0
-
-    alerta_jejum = False
-    mensagem_alerta = "Comportamento normal."
-
-    if primeira_refeicao_registrada and tempo_sem_comer_horas > LIMITE_JEJUM_HORAS:
-        alerta_jejum = True
-        mensagem_alerta = f"Atenção! Pet sem se alimentar há {round(tempo_sem_comer_horas, 1)}h."
-        
-        # Registra alerta no banco
-        conn = sqlite3.connect("petguard_local.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO alertas (timestamp, tipo_alerta, mensagem) VALUES (?, ?, ?)",
-            (agora.strftime("%Y-%m-%d %H:%M:%S"), "JEJUM_PROLONGADO", mensagem_alerta)
-        )
-        conn.commit()
-        conn.close()
 
     return {
         "timestamp": agora.strftime("%Y-%m-%d %H:%M:%S"),
-        "pet_info": {
-            "status_atual": status_atual,
-            "especie": pets[0]["especie"] if pets else "Não identificado",
-            "confianca_deteccao": pets[0]["confianca"] if pets else 0.0
-        },
-        "alimentacao": {
-            "esta_comendo": esta_comendo,
-            "ultima_refeicao": ultima_refeicao_dt.strftime("%H:%M:%S") if primeira_refeicao_registrada else "Nenhum registro hoje",
-            "horas_sem_comer": round(tempo_sem_comer_horas, 2)
-        },
-        "alertas": {
-            "alerta_jejum_ativo": alerta_jejum,
-            "mensagem": mensagem_alerta
-        },
-        "deteccoes_brutas": bounding_boxes_detectadas
+        "pets_detectados": pets,
+        "rois_ativas": list(rois.keys())
     }
-
-@app.get("/dashboard")
-def get_dashboard():
-    conn = sqlite3.connect("petguard_local.db")
-    cursor = conn.cursor()
-    
-    # Conta refeições do dia
-    hoje = datetime.datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("SELECT COUNT(*) FROM refeicoes WHERE timestamp LIKE ?", (f"{hoje}%",))
-    total_refeicoes_hoje = cursor.fetchone()[0]
-    
-    conn.close()
-
-    return {
-        "resumo_diario": {
-            "total_refeicoes_hoje": total_refeicoes_hoje,
-            "status_sistema": "Monitorando 24/7",
-            "ultima_refeicao": ultima_refeicao_dt.strftime("%H:%M:%S") if primeira_refeicao_registrada else "Sem registros"
-        }
-    }
-
-@app.get("/historico")
-def get_historico():
-    conn = sqlite3.connect("petguard_local.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, timestamp, especie, duracao_segundos FROM refeicoes ORDER BY id DESC LIMIT 10")
-    rows = cursor.fetchall()
-    conn.close()
-
-    historico = []
-    for r in rows:
-        historico.append({
-            "id": r[0],
-            "horario": r[1],
-            "especie": r[2],
-            "duracao_est_segundos": r[3]
-        })
-
-    return {"historico_refeicoes": historico}
-
-@app.get("/alertas-pendentes")
-def get_alertas():
-    conn = sqlite3.connect("petguard_local.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, timestamp, tipo_alerta, mensagem FROM alertas ORDER BY id DESC LIMIT 5")
-    rows = cursor.fetchall()
-    conn.close()
-
-    alertas = []
-    for r in rows:
-        alertas.append({
-            "id": r[0],
-            "horario": r[1],
-            "tipo": r[2],
-            "mensagem": r[3]
-        })
-
-    return {"alertas_criticos": alertas}
